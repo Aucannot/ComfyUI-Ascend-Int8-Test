@@ -10,6 +10,7 @@ import torch
 
 import comfy.ops
 import comfy.sd
+from comfy.comfy_types.node_typing import IO
 import folder_paths
 
 
@@ -23,6 +24,101 @@ SCALE_MODES = [
     "per_channel",
     "per_tensor",
 ]
+
+_RUNTIME_STATS = {}
+
+
+def _reset_runtime_stats():
+    _RUNTIME_STATS.clear()
+    _RUNTIME_STATS.update(
+        {
+            "linear_forward_calls": 0,
+            "torch_npu_int8_calls": 0,
+            "auto_fallback_dequant_calls": 0,
+            "forced_dequant_calls": 0,
+            "weight_patch_dequant_calls": 0,
+            "nan_input_calls": 0,
+            "inf_input_calls": 0,
+            "nan_output_calls": 0,
+            "inf_output_calls": 0,
+            "last_error": "",
+            "layers": {},
+        }
+    )
+
+
+def _bump_runtime(key: str, layer_name: str = ""):
+    _RUNTIME_STATS[key] = _RUNTIME_STATS.get(key, 0) + 1
+    if layer_name:
+        layer_stats = _RUNTIME_STATS.setdefault("layers", {}).setdefault(
+            layer_name,
+            {
+                "calls": 0,
+                "torch_npu_int8": 0,
+                "auto_fallback_dequant": 0,
+                "forced_dequant": 0,
+                "weight_patch_dequant": 0,
+            },
+        )
+        layer_stats["calls"] += 1
+        if key == "torch_npu_int8_calls":
+            layer_stats["torch_npu_int8"] += 1
+        elif key == "auto_fallback_dequant_calls":
+            layer_stats["auto_fallback_dequant"] += 1
+        elif key == "forced_dequant_calls":
+            layer_stats["forced_dequant"] += 1
+        elif key == "weight_patch_dequant_calls":
+            layer_stats["weight_patch_dequant"] += 1
+
+
+def _record_tensor_health(prefix: str, tensor: torch.Tensor):
+    if tensor is None or not tensor.dtype.is_floating_point:
+        return
+    try:
+        if torch.isnan(tensor).any().item():
+            _RUNTIME_STATS[f"nan_{prefix}_calls"] = _RUNTIME_STATS.get(f"nan_{prefix}_calls", 0) + 1
+        if torch.isinf(tensor).any().item():
+            _RUNTIME_STATS[f"inf_{prefix}_calls"] = _RUNTIME_STATS.get(f"inf_{prefix}_calls", 0) + 1
+    except Exception as e:
+        _RUNTIME_STATS["last_error"] = f"tensor health check failed: {e.__class__.__name__}: {e}"
+
+
+def _format_runtime_stats() -> str:
+    layer_lines = []
+    layers = _RUNTIME_STATS.get("layers", {})
+    for name, stats in sorted(layers.items(), key=lambda item: item[1]["calls"], reverse=True)[:40]:
+        layer_lines.append(
+            f"  {name}: calls={stats['calls']}, "
+            f"torch_npu_int8={stats['torch_npu_int8']}, "
+            f"auto_fallback_dequant={stats['auto_fallback_dequant']}, "
+            f"forced_dequant={stats['forced_dequant']}, "
+            f"weight_patch_dequant={stats['weight_patch_dequant']}"
+        )
+    if len(layers) > 40:
+        layer_lines.append(f"  ... {len(layers) - 40} more")
+    if not layer_lines:
+        layer_lines.append("  -")
+
+    return "\n".join(
+        [
+            "Ascend INT8 runtime report",
+            f"linear_forward_calls: {_RUNTIME_STATS.get('linear_forward_calls', 0)}",
+            f"torch_npu_int8_calls: {_RUNTIME_STATS.get('torch_npu_int8_calls', 0)}",
+            f"auto_fallback_dequant_calls: {_RUNTIME_STATS.get('auto_fallback_dequant_calls', 0)}",
+            f"forced_dequant_calls: {_RUNTIME_STATS.get('forced_dequant_calls', 0)}",
+            f"weight_patch_dequant_calls: {_RUNTIME_STATS.get('weight_patch_dequant_calls', 0)}",
+            f"nan_input_calls: {_RUNTIME_STATS.get('nan_input_calls', 0)}",
+            f"inf_input_calls: {_RUNTIME_STATS.get('inf_input_calls', 0)}",
+            f"nan_output_calls: {_RUNTIME_STATS.get('nan_output_calls', 0)}",
+            f"inf_output_calls: {_RUNTIME_STATS.get('inf_output_calls', 0)}",
+            f"last_error: {_RUNTIME_STATS.get('last_error', '') or '-'}",
+            "top_layers:",
+            *layer_lines,
+        ]
+    )
+
+
+_reset_runtime_stats()
 
 
 @dataclass
@@ -299,6 +395,8 @@ def make_ascend_int8_ops(config: Int8Config):
                     return super().forward(input, *args, **kwargs)
 
                 comfy.ops.run_every_op()
+                _RUNTIME_STATS["linear_forward_calls"] = _RUNTIME_STATS.get("linear_forward_calls", 0) + 1
+                _record_tensor_health("input", input)
 
                 input_shape = tuple(input.shape)
                 if input.ndim < 2:
@@ -311,18 +409,24 @@ def make_ascend_int8_ops(config: Int8Config):
 
                 # Weight patch functions, such as LoRA, need a real dequantized weight.
                 if len(self.weight_function) > 0 or len(self.bias_function) > 0:
+                    _bump_runtime("weight_patch_dequant_calls", self._ascend_int8_layer_name)
                     weight = self._dequant_weight_for_input(input)
                     for f in self.weight_function:
                         weight = f(weight)
                     out = torch.nn.functional.linear(x_2d, weight, bias)
                 elif config.backend == "fallback_dequant_only":
+                    _bump_runtime("forced_dequant_calls", self._ascend_int8_layer_name)
                     out = _dequantized_linear(x_2d, self.qweight, self.antiquant_scale, bias)
                 elif config.backend == "torch_npu_strict":
                     out = _torch_npu_weight_quant_linear(x_2d, self.qweight, self.antiquant_scale, bias)
+                    _bump_runtime("torch_npu_int8_calls", self._ascend_int8_layer_name)
                 else:
                     try:
                         out = _torch_npu_weight_quant_linear(x_2d, self.qweight, self.antiquant_scale, bias)
+                        _bump_runtime("torch_npu_int8_calls", self._ascend_int8_layer_name)
                     except Exception as e:
+                        _RUNTIME_STATS["last_error"] = f"{self._ascend_int8_layer_name}: {e.__class__.__name__}: {e}"
+                        _bump_runtime("auto_fallback_dequant_calls", self._ascend_int8_layer_name)
                         logging.debug(
                             "Ascend INT8 fallback for %s: %s",
                             self._ascend_int8_layer_name,
@@ -330,6 +434,7 @@ def make_ascend_int8_ops(config: Int8Config):
                         )
                         out = _dequantized_linear(x_2d, self.qweight, self.antiquant_scale, bias)
 
+                _record_tensor_health("output", out)
                 return out.reshape(input_shape[:-1] + (self.out_features,))
 
             def extra_repr(self):
@@ -412,6 +517,33 @@ class AscendInt8EnvironmentReport:
         return {"ui": {"text": (report,)}, "result": (report,)}
 
 
+class AscendInt8RuntimeReport:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source": (IO.ANY, {}),
+                "reset_after_report": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "ascend/int8"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def run(self, source=None, reset_after_report=False):
+        report = _format_runtime_stats()
+        if reset_after_report:
+            _reset_runtime_stats()
+        return {"ui": {"text": (report,)}, "result": (report,)}
+
+
 class AscendInt8UNETLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -424,6 +556,7 @@ class AscendInt8UNETLoader:
                 "exclude_regex": ("STRING", {"default": "", "multiline": False}),
                 "min_in_features": ("INT", {"default": 16, "min": 1, "max": 65536}),
                 "min_out_features": ("INT", {"default": 16, "min": 1, "max": 65536}),
+                "reset_runtime_stats": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -441,7 +574,10 @@ class AscendInt8UNETLoader:
         exclude_regex,
         min_in_features,
         min_out_features,
+        reset_runtime_stats=True,
     ):
+        if reset_runtime_stats:
+            _reset_runtime_stats()
         config = _make_config(backend, scale_mode, include_regex, exclude_regex, min_in_features, min_out_features)
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         model = comfy.sd.load_diffusion_model(unet_path, model_options=_load_model_options(config))
@@ -461,6 +597,7 @@ class AscendInt8CheckpointLoader:
                 "exclude_regex": ("STRING", {"default": "", "multiline": False}),
                 "min_in_features": ("INT", {"default": 16, "min": 1, "max": 65536}),
                 "min_out_features": ("INT", {"default": 16, "min": 1, "max": 65536}),
+                "reset_runtime_stats": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -478,7 +615,10 @@ class AscendInt8CheckpointLoader:
         exclude_regex,
         min_in_features,
         min_out_features,
+        reset_runtime_stats=True,
     ):
+        if reset_runtime_stats:
+            _reset_runtime_stats()
         config = _make_config(backend, scale_mode, include_regex, exclude_regex, min_in_features, min_out_features)
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
         model, clip, vae = comfy.sd.load_checkpoint_guess_config(
@@ -494,12 +634,14 @@ class AscendInt8CheckpointLoader:
 
 NODE_CLASS_MAPPINGS = {
     "AscendInt8EnvironmentReport": AscendInt8EnvironmentReport,
+    "AscendInt8RuntimeReport": AscendInt8RuntimeReport,
     "AscendInt8UNETLoader": AscendInt8UNETLoader,
     "AscendInt8CheckpointLoader": AscendInt8CheckpointLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AscendInt8EnvironmentReport": "Ascend INT8 Environment Report",
+    "AscendInt8RuntimeReport": "Ascend INT8 Runtime Report",
     "AscendInt8UNETLoader": "Load Diffusion Model (Ascend INT8)",
     "AscendInt8CheckpointLoader": "Load Checkpoint (Ascend INT8)",
 }
